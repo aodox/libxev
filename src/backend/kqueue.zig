@@ -75,7 +75,8 @@ pub const Loop = struct {
     /// Our queue of completed completions where the callback hasn't been
     /// called yet, but the "result" field should be set on every completion.
     /// This is used to delay completion callbacks until the next tick.
-    /// Values in the completion queue must not be in the kqueue.
+    /// A completion reported by `submit()` can still be registered in kqueue;
+    /// the queue defers its callback until the next tick (XEV-005).
     completions: queue.Intrusive(Completion) = .{},
 
     /// Heap of timers. We use heaps instead of the EVFILT_TIMER because
@@ -253,21 +254,30 @@ pub const Loop = struct {
 
                 const c: *Completion = @ptrFromInt(@as(usize, @intCast(ev.udata)));
 
+                // Level-triggered filters report again every kevent until the
+                // callback drains them. Skip if already queued/dispatching —
+                // before perform() so a second read/accept cannot consume work
+                // then discard the result (farbenbuilds/libxev XEV-004/#169).
+                if (c.flags.state != .active or
+                    c.flags.threadpool or
+                    c.next != null or
+                    self.completions.tail == c) continue;
+
                 // If EV_ERROR is set, then submission failed for this
                 // completion. We get the syscall errorcode from data and
                 // store it.
                 if (ev.flags & std.c.EV.ERROR != 0) {
                     c.result = c.syscall_result(-@as(i32, @intCast(ev.data)));
+                    // Filter never registered; balance active from start().
+                    std.debug.assert(self.active > 0);
+                    self.active -= 1;
+                    c.flags.state = .dead;
                 } else {
                     // No error, means that this completion is ready to work.
                     c.result = c.perform(&ev);
                 }
 
                 assert(c.result != null);
-                // Defensive: clear intrusive link before another queue push
-                // (mitchellh/libxev#169 / PR #224). Prevents queue.zig assert
-                // when a completion is transiently in multiple queues.
-                c.next = null;
                 self.completions.push(c);
             }
         }
@@ -460,12 +470,18 @@ pub const Loop = struct {
                         if (c_active) self.active -= 1;
                     },
 
-                    // Only resubmit if we aren't already active (in the queue).
-                    // Non-kqueue completions (close/shutdown/threadpool fallback)
-                    // finish as .dead; must mark .adding or submit() routes to
-                    // stop_completion instead of start (mitchellh/libxev#170 / PR #224).
-                    .rearm => if (!c_active) {
+                    // Still registered with kqueue (submit reported the event):
+                    // stay .active or the next event queues it twice →
+                    // "invalid state … state=.active" (PR #245 / XEV-003;
+                    // uWebZockets: 12/28 → 0/29 at c64). Never-registered
+                    // completions resubmit as .adding (XEV-005 / #170).
+                    .rearm => if (disarm_ev != null) {
+                        c.flags.state = .active;
+                        c.result = null;
+                    } else {
+                        if (c_active) self.active -= 1;
                         c.flags.state = .adding;
+                        c.result = null;
                         self.submissions.push(c);
                     },
                 }
@@ -541,11 +557,18 @@ pub const Loop = struct {
                     // at this point for this event.
                     continue;
                 }
-                wait_rem -|= 1;
 
                 const c: *Completion = @ptrFromInt(@as(usize, @intCast(ev.udata)));
 
-                // c is ready to be reused rigt away if we're dearming
+                // Nested submit() can requeue a ready completion from this
+                // outer batch. Skip; queued copy will run the callback (XEV-005).
+                if (c.flags.state != .active or
+                    c.flags.threadpool or
+                    c.next != null or
+                    self.completions.tail == c) continue;
+                wait_rem -|= 1;
+
+                // c is ready to be reused right away if we're disarming
                 // so we mark it as dead.
                 c.flags.state = .dead;
 
@@ -2871,6 +2894,352 @@ test "kqueue: timer armed from delayed callback must not fire early" {
     const elapsed_ns = state.timer_fired_ns - state.timer_started_ns;
     const elapsed_ms: i128 = @divFloor(elapsed_ns, std.time.ns_per_ms);
     try testing.expect(elapsed_ms >= @as(i128, @intCast(timer_delay_ms)));
+}
+
+// XEV-003 / mitchellh/libxev#245 — farbenbuilds/uWebZockets measured 12/28 → 0/29
+// invalid-state at c64 with this rearm-stays-active fix (#224 alone left 12/28).
+test "kqueue: cancel after a rearm of a completion reported at submit" {
+    const testing = std.testing;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    // Readable before submission, so submit's event list reports it and the
+    // callback runs from the completion queue.
+    try testing.expectEqual(@as(isize, 1), std.c.write(fds[1], "a", 1));
+
+    const State = struct { reads: usize = 0, canceled: bool = false };
+    var state: State = .{};
+    var buf: [1]u8 = undefined;
+    var c: Completion = .{
+        .op = .{ .read = .{ .fd = fds[0], .buffer = .{ .slice = &buf } } },
+        .userdata = &state,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, _: *Loop, _: *Completion, r: Result) CallbackAction {
+                const s = @as(*State, @ptrCast(@alignCast(ud.?)));
+                _ = r.read catch |err| {
+                    s.canceled = err == error.Canceled;
+                    return .disarm;
+                };
+                s.reads += 1;
+                return .rearm;
+            }
+        }).callback,
+    };
+    loop.add(&c);
+    try loop.run(.no_wait);
+    try testing.expectEqual(@as(usize, 1), state.reads);
+    try testing.expect(c.state() == .active);
+
+    var cancel: Completion = .{
+        .op = .{ .cancel = .{ .c = &c } },
+        .callback = (struct {
+            fn callback(_: ?*anyopaque, _: *Loop, _: *Completion, r: Result) CallbackAction {
+                _ = r.cancel catch unreachable;
+                return .disarm;
+            }
+        }).callback,
+    };
+    loop.add(&cancel);
+    try loop.run(.no_wait);
+    try testing.expect(state.canceled);
+
+    // Cancelled, so new data must not reach the callback.
+    try testing.expectEqual(@as(isize, 1), std.c.write(fds[1], "b", 1));
+    try loop.run(.no_wait);
+    try testing.expectEqual(@as(usize, 1), state.reads);
+    try testing.expectEqual(@as(usize, 0), loop.active);
+}
+
+// XEV-004 — level-triggered duplicate queue before perform() (#169).
+test "kqueue: a still-readable completion is queued once across submits" {
+    const testing = std.testing;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var other_fds: [2]posix.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&other_fds));
+    defer _ = std.c.close(other_fds[0]);
+    defer _ = std.c.close(other_fds[1]);
+
+    // Two bytes with a one-byte buffer: submit() reads the first, and the
+    // descriptor stays readable, so the next kevent call reports it again
+    // while the completion is still waiting in the completion queue.
+    try testing.expectEqual(@as(isize, 2), std.c.write(fds[1], "ab", 2));
+    try testing.expectEqual(@as(isize, 1), std.c.write(other_fds[1], "x", 1));
+
+    const State = struct {
+        buf: [1]u8 = undefined,
+        seen: [4]u8 = undefined,
+        reads: usize = 0,
+    };
+    var state: State = .{};
+    var c: Completion = .{
+        .op = .{ .read = .{ .fd = fds[0], .buffer = .{ .slice = &state.buf } } },
+        .userdata = &state,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, _: *Loop, _: *Completion, r: Result) CallbackAction {
+                const s = @as(*State, @ptrCast(@alignCast(ud.?)));
+                _ = r.read catch return .disarm;
+                s.seen[s.reads] = s.buf[0];
+                s.reads += 1;
+                return if (s.reads < 2) .rearm else .disarm;
+            }
+        }).callback,
+    };
+    var other_buf: [1]u8 = undefined;
+    var other: Completion = .{
+        .op = .{ .read = .{ .fd = other_fds[0], .buffer = .{ .slice = &other_buf } } },
+        .callback = (struct {
+            fn callback(_: ?*anyopaque, _: *Loop, _: *Completion, _: Result) CallbackAction {
+                return .disarm;
+            }
+        }).callback,
+    };
+
+    loop.add(&c);
+    try loop.submit();
+    loop.add(&other);
+    try loop.submit();
+
+    var ticks: usize = 0;
+    while (state.reads < 2 and ticks < 16) : (ticks += 1) try loop.run(.no_wait);
+
+    try testing.expectEqual(@as(usize, 2), state.reads);
+    try testing.expectEqualSlices(u8, "ab", state.seen[0..2]);
+}
+
+fn make_pipe() ![2]posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.Unexpected;
+    return fds;
+}
+
+// XEV-005 — nested submit must not requeue the current completion.
+test "kqueue: nested submit does not requeue the current completion" {
+    const testing = std.testing;
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    const data_pipe = try make_pipe();
+    defer _ = std.c.close(data_pipe[0]);
+    defer _ = std.c.close(data_pipe[1]);
+    const dummy_pipe = try make_pipe();
+    defer _ = std.c.close(dummy_pipe[0]);
+    defer _ = std.c.close(dummy_pipe[1]);
+
+    try testing.expectEqual(@as(isize, 2), std.c.write(data_pipe[1], "ab", 2));
+    try testing.expectEqual(@as(isize, 1), std.c.write(dummy_pipe[1], "x", 1));
+
+    const Context = struct {
+        dummy: *Completion,
+        reads: usize = 0,
+        read_buffer: [1]u8 = undefined,
+    };
+    var dummy_reads: usize = 0;
+    var dummy_buffer: [1]u8 = undefined;
+    var dummy: Completion = .{
+        .op = .{ .read = .{ .fd = dummy_pipe[0], .buffer = .{ .slice = &dummy_buffer } } },
+        .userdata = &dummy_reads,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, _: *Loop, _: *Completion, r: Result) CallbackAction {
+                _ = r.read catch return .disarm;
+                const count: *usize = @ptrCast(@alignCast(ud.?));
+                count.* += 1;
+                return .disarm;
+            }
+        }).callback,
+    };
+    var context: Context = .{ .dummy = &dummy };
+    var current: Completion = .{
+        .op = .{ .read = .{ .fd = data_pipe[0], .buffer = .{ .slice = &context.read_buffer } } },
+        .userdata = &context,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, event_loop: *Loop, _: *Completion, r: Result) CallbackAction {
+                const ctx: *Context = @ptrCast(@alignCast(ud.?));
+                _ = r.read catch return .disarm;
+                ctx.reads += 1;
+                if (ctx.reads == 1) {
+                    event_loop.add(ctx.dummy);
+                    event_loop.submit() catch unreachable;
+                }
+                return if (ctx.reads < 2) .rearm else .disarm;
+            }
+        }).callback,
+    };
+
+    loop.add(&current);
+    try loop.submit();
+    try loop.run(.until_done);
+
+    try testing.expectEqual(@as(usize, 2), context.reads);
+    try testing.expectEqual(@as(usize, 1), dummy_reads);
+    try testing.expectEqual(@as(usize, 0), loop.active);
+}
+
+test "kqueue: nested submit does not double-dispatch an outer batch" {
+    const testing = std.testing;
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    const first_pipe = try make_pipe();
+    defer _ = std.c.close(first_pipe[0]);
+    defer _ = std.c.close(first_pipe[1]);
+    const second_pipe = try make_pipe();
+    defer _ = std.c.close(second_pipe[0]);
+    defer _ = std.c.close(second_pipe[1]);
+    const dummy_pipe = try make_pipe();
+    defer _ = std.c.close(dummy_pipe[0]);
+    defer _ = std.c.close(dummy_pipe[1]);
+
+    const Context = struct {
+        dummy: *Completion,
+        first_reads: usize = 0,
+        second_reads: usize = 0,
+        nested: bool = false,
+        first_buffer: [1]u8 = undefined,
+        second_buffer: [1]u8 = undefined,
+    };
+    var dummy_reads: usize = 0;
+    var dummy_buffer: [1]u8 = undefined;
+    var dummy: Completion = .{
+        .op = .{ .read = .{ .fd = dummy_pipe[0], .buffer = .{ .slice = &dummy_buffer } } },
+        .userdata = &dummy_reads,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, _: *Loop, _: *Completion, r: Result) CallbackAction {
+                _ = r.read catch return .disarm;
+                const count: *usize = @ptrCast(@alignCast(ud.?));
+                count.* += 1;
+                return .disarm;
+            }
+        }).callback,
+    };
+    var context: Context = .{ .dummy = &dummy };
+    var first: Completion = .{
+        .op = .{ .read = .{ .fd = first_pipe[0], .buffer = .{ .slice = &context.first_buffer } } },
+        .userdata = &context,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, event_loop: *Loop, _: *Completion, r: Result) CallbackAction {
+                const ctx: *Context = @ptrCast(@alignCast(ud.?));
+                _ = r.read catch return .disarm;
+                ctx.first_reads += 1;
+                if (!ctx.nested) {
+                    ctx.nested = true;
+                    event_loop.add(ctx.dummy);
+                    event_loop.submit() catch unreachable;
+                }
+                return .disarm;
+            }
+        }).callback,
+    };
+    var second: Completion = .{
+        .op = .{ .read = .{ .fd = second_pipe[0], .buffer = .{ .slice = &context.second_buffer } } },
+        .userdata = &context,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, event_loop: *Loop, _: *Completion, r: Result) CallbackAction {
+                const ctx: *Context = @ptrCast(@alignCast(ud.?));
+                _ = r.read catch return .disarm;
+                ctx.second_reads += 1;
+                if (!ctx.nested) {
+                    ctx.nested = true;
+                    event_loop.add(ctx.dummy);
+                    event_loop.submit() catch unreachable;
+                }
+                return .disarm;
+            }
+        }).callback,
+    };
+
+    loop.add(&first);
+    loop.add(&second);
+    try loop.submit();
+    try testing.expectEqual(@as(isize, 1), std.c.write(first_pipe[1], "a", 1));
+    try testing.expectEqual(@as(isize, 1), std.c.write(second_pipe[1], "b", 1));
+    try testing.expectEqual(@as(isize, 1), std.c.write(dummy_pipe[1], "x", 1));
+
+    try loop.run(.no_wait);
+    try loop.run(.until_done);
+
+    try testing.expectEqual(@as(usize, 1), context.first_reads);
+    try testing.expectEqual(@as(usize, 1), context.second_reads);
+    try testing.expectEqual(@as(usize, 1), dummy_reads);
+    try testing.expectEqual(@as(usize, 0), loop.active);
+}
+
+test "kqueue: EV_ERROR balances the active count" {
+    const testing = std.testing;
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    const pipe_fds = try make_pipe();
+    try testing.expectEqual(@as(c_int, 0), std.c.close(pipe_fds[0]));
+    try testing.expectEqual(@as(c_int, 0), std.c.close(pipe_fds[1]));
+
+    var invalid_buffer: [1]u8 = undefined;
+    var read_completion: Completion = .{
+        .op = .{ .read = .{ .fd = pipe_fds[0], .buffer = .{ .slice = &invalid_buffer } } },
+        .userdata = null,
+        .callback = (struct {
+            fn callback(_: ?*anyopaque, _: *Loop, _: *Completion, r: Result) CallbackAction {
+                _ = r.read catch {};
+                return .disarm;
+            }
+        }).callback,
+    };
+
+    loop.add(&read_completion);
+    try loop.run(.no_wait);
+    try testing.expectEqual(@as(usize, 0), loop.active);
+}
+
+test "kqueue: rearm from a non-kqueue completion resubmits" {
+    const testing = std.testing;
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    const first_pipe = try make_pipe();
+    defer _ = std.c.close(first_pipe[1]);
+    const second_pipe = try make_pipe();
+    defer _ = std.c.close(second_pipe[1]);
+
+    const Context = struct {
+        second_fd: posix.fd_t,
+        closes: usize = 0,
+    };
+    var context: Context = .{ .second_fd = second_pipe[0] };
+    var close_completion: Completion = .{
+        .op = .{ .close = .{ .fd = first_pipe[0] } },
+        .userdata = &context,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, _: *Loop, c: *Completion, r: Result) CallbackAction {
+                _ = r.close catch unreachable;
+                const ctx: *Context = @ptrCast(@alignCast(ud.?));
+                ctx.closes += 1;
+                if (ctx.closes == 1) {
+                    c.op = .{ .close = .{ .fd = ctx.second_fd } };
+                    return .rearm;
+                }
+                return .disarm;
+            }
+        }).callback,
+    };
+
+    loop.add(&close_completion);
+    try loop.run(.no_wait);
+    try loop.run(.no_wait);
+
+    try testing.expectEqual(@as(usize, 2), context.closes);
+    try testing.expectEqual(@as(usize, 0), loop.active);
 }
 
 test "kqueue: socket accept/cancel cancellation should decrease active count" {
