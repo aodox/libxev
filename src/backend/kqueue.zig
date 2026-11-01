@@ -264,6 +264,10 @@ pub const Loop = struct {
                 }
 
                 assert(c.result != null);
+                // Defensive: clear intrusive link before another queue push
+                // (mitchellh/libxev#169 / PR #224). Prevents queue.zig assert
+                // when a completion is transiently in multiple queues.
+                c.next = null;
                 self.completions.push(c);
             }
         }
@@ -456,8 +460,14 @@ pub const Loop = struct {
                         if (c_active) self.active -= 1;
                     },
 
-                    // Only resubmit if we aren't already active (in the queue)
-                    .rearm => if (!c_active) self.submissions.push(c),
+                    // Only resubmit if we aren't already active (in the queue).
+                    // Non-kqueue completions (close/shutdown/threadpool fallback)
+                    // finish as .dead; must mark .adding or submit() routes to
+                    // stop_completion instead of start (mitchellh/libxev#170 / PR #224).
+                    .rearm => if (!c_active) {
+                        c.flags.state = .adding;
+                        self.submissions.push(c);
+                    },
                 }
 
                 // If we filled the events slice, we break to avoid overflow.
@@ -562,8 +572,11 @@ pub const Loop = struct {
                 }
             }
 
-            // If we ran through the loop once we break if we don't care.
-            if (wait == 0) break;
+            // If we ran through the loop once we break if we don't care —
+            // but only when no pending kevent changes remain. Otherwise
+            // EV_DELETE from .disarm never reaches the kernel (stale udata /
+            // UAF under .no_wait). mitchellh/libxev#209 / PR #224.
+            if (wait == 0 and changes == 0) break;
         }
     }
 
