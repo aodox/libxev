@@ -37,6 +37,7 @@
 const ThreadPool = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Atomic = std.atomic.Value;
 const Io = std.Io;
@@ -53,6 +54,14 @@ idle_event: Event = .{},
 join_event: Event = .{},
 run_queue: Node.Queue = .{},
 threads: Atomic(?*Thread) = Atomic(?*Thread).init(null),
+/// POSIX self-pipe. `schedule` writes one byte after the push. A worker
+/// blocked in `read` wakes, and the byte stays in the pipe if it is still
+/// inside a callback. Darwin `__ulock_wake` is edge-triggered: once `notified`
+/// is set, later accepts return without a wake, hev's SOCKS read times out,
+/// and the phone opens another session. Device 20261107r: claim ran for
+/// ~15s after CloseAll, then stopped while tun TX and RSS kept climbing.
+wake_r: c_int = -1,
+wake_w: c_int = -1,
 
 const Sync = packed struct {
     /// Tracks the number of threads not searching for Tasks
@@ -87,18 +96,33 @@ pub const Config = struct {
 
 /// Statically initialize the thread pool using the configuration.
 pub fn init(config: Config) ThreadPool {
-    return .{
+    var pool: ThreadPool = .{
         .stack_size = @max(1, config.stack_size),
         .max_threads = if (config.max_threads > 0)
             config.max_threads
         else
             @intCast(std.Thread.getCpuCount() catch 1),
     };
+    if (comptime builtin.os.tag != .windows) {
+        var fds: [2]std.c.fd_t = .{ -1, -1 };
+        if (std.c.pipe(&fds) == 0) {
+            pool.wake_r = fds[0];
+            pool.wake_w = fds[1];
+            setWriteNonblock(fds[1]);
+        }
+    }
+    return pool;
 }
 
 /// Wait for a thread to call shutdown() on the thread pool and kill the worker threads.
 pub fn deinit(self: *ThreadPool) void {
     self.join();
+    if (comptime builtin.os.tag != .windows) {
+        if (self.wake_r >= 0) _ = std.c.close(self.wake_r);
+        if (self.wake_w >= 0) _ = std.c.close(self.wake_w);
+        self.wake_r = -1;
+        self.wake_w = -1;
+    }
     self.* = undefined;
 }
 
@@ -157,9 +181,11 @@ pub fn schedule(self: *ThreadPool, batch: Batch) void {
         self.run_queue.push(list);
     }
 
-    // Try to notify a thread
+    // Try to notify a thread. The pipe write is the wake that cannot be
+    // dropped: `notify` may return early when `notified` is already set.
     const is_waking = false;
-    return self.notify(is_waking);
+    self.notify(is_waking);
+    self.poke();
 }
 
 inline fn notify(self: *ThreadPool, is_waking: bool) void {
@@ -168,6 +194,18 @@ inline fn notify(self: *ThreadPool, is_waking: bool) void {
     if (!is_waking) {
         const sync: Sync = @bitCast(self.sync.load(.monotonic));
         if (sync.notified) {
+            // `notified` only means a wake was posted. The worker may already
+            // be inside `idle_event.wait()` (futex) and have missed that wake.
+            // Accept schedules from the Loop thread. Once this returns without
+            // signaling, every later schedule takes the same path, the queue
+            // is never popped, and hev sits in the SOCKS handshake until the
+            // phone retries. Device: claim stopped while accept kept climbing
+            // and hevSess sat on the session cap. Signal again while someone
+            // is idle; a duplicate wake is a spurious pop, not a lost job.
+            if (sync.idle > 0) {
+                self.idle_event.notify();
+                self.poke();
+            }
             return;
         }
     }
@@ -206,7 +244,9 @@ noinline fn notifySlow(self: *ThreadPool, is_waking: bool) void {
         ) orelse {
             // We signaled to notify an idle thread
             if (can_wake and sync.idle > 0) {
-                return self.idle_event.notify();
+                self.idle_event.notify();
+                self.poke();
+                return;
             }
 
             // We signaled to spawn a new thread
@@ -272,7 +312,7 @@ noinline fn wait(self: *ThreadPool, _is_waking: bool) error{Shutdown}!bool {
             // Wait for a signal by either notify() or shutdown() without wasting cpu cycles.
             // TODO: Add I/O polling here.
         } else {
-            self.idle_event.wait();
+            self.waitPoke();
             sync = @bitCast(self.sync.load(.monotonic));
         }
     }
@@ -297,10 +337,58 @@ pub noinline fn shutdown(self: *ThreadPool) void {
             // Wake up any threads sleeping on the idle_event.
             // TODO: I/O polling notification here.
             if (sync.idle > 0) self.idle_event.shutdown();
+            self.wakeSleepers();
             if (sync.spawned == 0) self.join_event.notify();
             return;
         });
     }
+}
+
+fn poke(self: *ThreadPool) void {
+    if (comptime builtin.os.tag == .windows) return;
+    if (self.wake_w < 0) return;
+    var byte = [1]u8{1};
+    while (true) {
+        const n = std.c.write(self.wake_w, &byte, 1);
+        if (n >= 0) return;
+        if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+        return;
+    }
+}
+
+fn waitPoke(self: *ThreadPool) void {
+    if (comptime builtin.os.tag == .windows) {
+        self.idle_event.wait();
+        return;
+    }
+    if (self.wake_r < 0) {
+        self.idle_event.wait();
+        return;
+    }
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const n = std.c.read(self.wake_r, &byte, 1);
+        if (n >= 0) return;
+        if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+        return;
+    }
+}
+
+fn wakeSleepers(self: *ThreadPool) void {
+    var i: u32 = 0;
+    const n = if (self.max_threads == 0) 1 else self.max_threads;
+    while (i < n) : (i += 1) self.poke();
+}
+
+fn setWriteNonblock(fd: std.c.fd_t) void {
+    const flags = std.c.fcntl(fd, std.c.F.GETFL);
+    if (flags < 0) return;
+    // Darwin O_NONBLOCK is 0x4. Linux and the BSDs use 0o4000.
+    const nb: c_int = switch (builtin.os.tag) {
+        .linux, .freebsd, .openbsd, .netbsd, .dragonfly => 0o4000,
+        else => 0x0004,
+    };
+    _ = std.c.fcntl(fd, std.c.F.SETFL, flags | nb);
 }
 
 fn register(noalias self: *ThreadPool, noalias thread: *Thread) void {
