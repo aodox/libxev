@@ -310,12 +310,21 @@ fn UDPSendtoIOCP(comptime xev: type) type {
                                 r: xev.Result,
                             ) xev.CallbackAction {
                                 const s_inner: *State = @ptrCast(@alignCast(ud.?));
+                                const peer = peer_addr: {
+                                    const none = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+                                    _ = r.recvfrom catch break :peer_addr none;
+                                    const parsed = net.Address.initPosix(@ptrCast(&c_inner.op.recvfrom.addr));
+                                    break :peer_addr switch (parsed.any.family) {
+                                        posix.AF.INET, posix.AF.INET6 => parsed.toIpAddress(),
+                                        else => none,
+                                    };
+                                };
                                 return @call(.always_inline, cb, .{
                                     common.userdataValue(Userdata, s_inner.userdata),
                                     l_inner,
                                     c_inner,
                                     s_inner,
-                                    net.Address.initPosix(@alignCast(&c_inner.op.recvfrom.addr)).toIpAddress(),
+                                    peer,
                                     initFd(c_inner.op.recvfrom.fd),
                                     c_inner.op.recvfrom.buffer,
                                     r.recvfrom,

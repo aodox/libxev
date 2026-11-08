@@ -700,6 +700,9 @@ pub const Loop = struct {
                 self.associate_fd(completion.handle().?) catch unreachable;
                 const buffer: []u8 = if (v.buffer == .slice) v.buffer.slice else &v.buffer.array;
                 v.wsa_buffer = .{ .buf = buffer.ptr, .len = @as(u32, @intCast(buffer.len)) };
+                // Reset every submit. A previous IPv4 peer shrinks addr_size to 16
+                // and the next IPv6 datagram then fails WSAEFAULT.
+                v.addr_size = @sizeOf(posix.sockaddr.storage);
 
                 var flags: u32 = 0;
 
@@ -709,7 +712,7 @@ pub const Loop = struct {
                     1,
                     null,
                     &flags,
-                    &v.addr,
+                    @ptrCast(&v.addr),
                     @as(*i32, @ptrCast(&v.addr_size)),
                     &completion.overlapped,
                     null,
@@ -844,7 +847,12 @@ pub const Loop = struct {
                 }
             },
 
-            else => @panic("Not implemented"),
+            // `state()` reports `.adding` as `.active`, so a cancel of a
+            // not-yet-submitted shutdown/close/connect marks it `.dead` and
+            // the next `submit` lands here. Those ops have no overlapped
+            // I/O. Panicking took down the process (page-storm sid linger
+            // both_eof → fail → this branch).
+            else => {},
         }
     }
 
@@ -1322,8 +1330,8 @@ pub const Operation = union(OperationType) {
     recvfrom: struct {
         fd: windows.HANDLE,
         buffer: ReadBuffer,
-        addr: posix.sockaddr = undefined,
-        addr_size: posix.socklen_t = @sizeOf(posix.sockaddr),
+        addr: posix.sockaddr.storage = undefined,
+        addr_size: posix.socklen_t = @sizeOf(posix.sockaddr.storage),
         wsa_buffer: windows.WSABUF = undefined,
     },
 
