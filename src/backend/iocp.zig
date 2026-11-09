@@ -548,14 +548,34 @@ pub const Loop = struct {
             .close => |v| .{ .result = .{ .close = windows.CloseHandle(v.fd) } },
 
             .connect => |*v| action: {
-                const result = windows.ws2_32.connect(asSocket(v.socket), &v.addr.any, @as(i32, @intCast(v.addr.getOsSockLen())));
-                if (result != 0) {
+                // ConnectEx: the wait is this socket's overlapped completion.
+                // A blocking ws2_32.connect here would stall the Loop.
+                self.associate_fd(v.socket) catch {
+                    break :action .{ .result = .{ .connect = error.Unexpected } };
+                };
+                bindAny(asSocket(v.socket), v.addr) catch |err| {
+                    break :action .{ .result = .{ .connect = err } };
+                };
+                const connect_ex = loadConnectEx(asSocket(v.socket)) catch |err| {
+                    break :action .{ .result = .{ .connect = err } };
+                };
+                const rc = connect_ex(
+                    asSocket(v.socket),
+                    &v.addr.any,
+                    @intCast(v.addr.getOsSockLen()),
+                    null,
+                    0,
+                    null,
+                    &completion.overlapped,
+                );
+                if (rc != windows.TRUE) {
                     const err = windows.ws2_32.WSAGetLastError();
-                    break :action switch (err) {
-                        else => .{ .result = .{ .connect = windows.unexpectedWSAError(err) } },
-                    };
+                    if (err == windows.ws2_32.WinsockError.WSA_IO_PENDING) {
+                        break :action .{ .submitted = {} };
+                    }
+                    break :action .{ .result = .{ .connect = mapConnectWsa(err) } };
                 }
-                break :action .{ .result = .{ .connect = {} } };
+                break :action .{ .submitted = {} };
             },
 
             .read => |*v| action: {
@@ -838,6 +858,15 @@ pub const Loop = struct {
                 }
             },
 
+            .connect => |*v| {
+                if (completion.flags.state == .active) {
+                    const result = windows.kernel32.CancelIoEx(asSocket(v.socket), &completion.overlapped);
+                    cancel_result.?.* = if (result == windows.FALSE)
+                        windows.unexpectedError(windows.kernel32.GetLastError())
+                    else {};
+                }
+            },
+
             inline .read, .pread, .write, .pwrite, .recv, .send, .sendto, .recvfrom => |*v| {
                 if (completion.flags.state == .active) {
                     const result = windows.kernel32.CancelIoEx(asSocket(v.fd), &completion.overlapped);
@@ -848,10 +877,8 @@ pub const Loop = struct {
             },
 
             // `state()` reports `.adding` as `.active`, so a cancel of a
-            // not-yet-submitted shutdown/close/connect marks it `.dead` and
-            // the next `submit` lands here. Those ops have no overlapped
-            // I/O. Panicking took down the process (page-storm sid linger
-            // both_eof → fail → this branch).
+            // not-yet-submitted shutdown/close marks it `.dead` and the next
+            // `submit` lands here. Those ops have no overlapped I/O.
             else => {},
         }
     }
@@ -886,6 +913,70 @@ pub const Loop = struct {
 /// Convenience to convert from windows.HANDLE to windows.ws2_32.SOCKET (which are the same thing).
 inline fn asSocket(h: windows.HANDLE) windows.ws2_32.SOCKET {
     return @as(windows.ws2_32.SOCKET, @ptrCast(h));
+}
+
+const ConnectExFn = *const fn (
+    windows.ws2_32.SOCKET,
+    *const posix.sockaddr,
+    i32,
+    ?*anyopaque,
+    u32,
+    ?*u32,
+    *windows.OVERLAPPED,
+) callconv(.winapi) windows.BOOL;
+
+var connect_ex_fn: ?ConnectExFn = null;
+
+fn loadConnectEx(sock: windows.ws2_32.SOCKET) ConnectError!ConnectExFn {
+    if (connect_ex_fn) |f| return f;
+    const guid = extern struct {
+        data1: u32 = 0x25a207b9,
+        data2: u16 = 0xddf3,
+        data3: u16 = 0x4660,
+        data4: [8]u8 = .{ 0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e },
+    }{};
+    var fn_ptr: ConnectExFn = undefined;
+    var got: windows.DWORD = 0;
+    const rc = windows.ws2_32.WSAIoctl(
+        sock,
+        0xC8000006,
+        &guid,
+        @sizeOf(@TypeOf(guid)),
+        @ptrCast(&fn_ptr),
+        @sizeOf(ConnectExFn),
+        &got,
+        null,
+        null,
+    );
+    if (rc != 0) return error.Unexpected;
+    connect_ex_fn = fn_ptr;
+    return fn_ptr;
+}
+
+fn bindAny(sock: windows.ws2_32.SOCKET, addr: net.Address) ConnectError!void {
+    const any: net.Address = switch (addr.any.family) {
+        posix.AF.INET => net.Address.initIp4(@splat(0), 0),
+        posix.AF.INET6 => net.Address.fromIpAddress(.{ .ip6 = .{ .bytes = @splat(0), .port = 0 } }),
+        else => return error.Unexpected,
+    };
+    if (windows.ws2_32.bind(sock, &any.any, @intCast(any.getOsSockLen())) == 0) return;
+    const err = @intFromEnum(windows.ws2_32.WSAGetLastError());
+    // Already bound (ConnectEx retry / caller bind).
+    if (err == 10022 or err == 10048) return;
+    return error.Unexpected;
+}
+
+fn mapConnectWsa(err: windows.ws2_32.WinsockError) ConnectError {
+    return switch (@intFromEnum(err)) {
+        @intFromEnum(windows.ws2_32.WinsockError.WSA_OPERATION_ABORTED) => error.Canceled,
+        10060 => error.Timeout,
+        10061 => error.ConnectionRefused,
+        10054 => error.ConnectionResetByPeer,
+        10065 => error.HostUnreachable,
+        10051 => error.NetworkUnreachable,
+        10050 => error.NetworkDown,
+        else => error.Unexpected,
+    };
 }
 
 fn iocpShutdown(sock: windows.ws2_32.SOCKET, how: ShutdownHow) ShutdownError!void {
@@ -999,7 +1090,7 @@ pub const Completion = struct {
     /// Returns a handle for the current operation if it makes sense.
     fn handle(self: Completion) ?windows.HANDLE {
         return switch (self.op) {
-            inline .accept => |*v| v.socket,
+            inline .accept, .connect => |*v| v.socket,
             inline .read, .pread, .write, .pwrite, .recv, .send, .recvfrom, .sendto => |*v| v.fd,
             else => null,
         };
@@ -1009,7 +1100,7 @@ pub const Completion = struct {
     /// operation for the completion.
     pub fn perform(self: *Completion) Result {
         return switch (self.op) {
-            .noop, .close, .connect, .shutdown, .timer, .cancel => {
+            .noop, .close, .shutdown, .timer, .cancel => {
                 std.log.warn("perform op={s}", .{@tagName(self.op)});
                 unreachable;
             },
@@ -1032,6 +1123,21 @@ pub const Completion = struct {
                 }
 
                 return .{ .accept = self.op.accept.internal_accept_socket.? };
+            },
+
+            .connect => |*v| {
+                var bytes_transferred: u32 = 0;
+                var flags: u32 = 0;
+                const result = windows.ws2_32.WSAGetOverlappedResult(asSocket(v.socket), &self.overlapped, &bytes_transferred, windows.FALSE, &flags);
+                if (result != windows.TRUE) {
+                    return .{ .connect = mapConnectWsa(windows.ws2_32.WSAGetLastError()) };
+                }
+                // Required before send/recv on a ConnectEx socket.
+                var unused: u8 = 0;
+                if (windows.ws2_32.setsockopt(asSocket(v.socket), windows.ws2_32.SOL.SOCKET, 0x7010, @ptrCast(&unused), 0) != 0) {
+                    return .{ .connect = error.Unexpected };
+                }
+                return .{ .connect = {} };
             },
 
             .read => |*v| {
@@ -1397,6 +1503,12 @@ pub const CloseError = error{
 pub const ConnectError = error{
     Canceled,
     Unexpected,
+    Timeout,
+    ConnectionRefused,
+    ConnectionResetByPeer,
+    HostUnreachable,
+    NetworkUnreachable,
+    NetworkDown,
 };
 
 pub const ShutdownError = error{

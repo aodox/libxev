@@ -348,6 +348,18 @@ pub const ws2_32 = struct {
         namelen: i32,
     ) callconv(.winapi) i32;
 
+    pub extern "ws2_32" fn WSAIoctl(
+        s: SOCKET,
+        dwIoControlCode: DWORD,
+        lpvInBuffer: ?*const anyopaque,
+        cbInBuffer: DWORD,
+        lpvOutBuffer: ?*anyopaque,
+        cbOutBuffer: DWORD,
+        lpcbBytesReturned: *DWORD,
+        lpOverlapped: ?*OVERLAPPED,
+        lpCompletionRoutine: ?*anyopaque,
+    ) callconv(.winapi) i32;
+
     pub extern "ws2_32" fn getsockname(
         s: SOCKET,
         name: *posix.sockaddr,

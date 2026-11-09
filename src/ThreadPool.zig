@@ -133,6 +133,10 @@ pub const Task = struct {
     callback: *const fn (*Task) void,
 };
 
+/// Product sets this to log a destroyed callback before the indirect call.
+/// Null keeps the pool behavior unchanged.
+pub var on_before_run: ?*const fn (*Task) void = null;
+
 /// An unordered collection of Tasks which can be submitted for scheduling as a group.
 pub const Batch = struct {
     len: usize = 0,
@@ -469,7 +473,18 @@ const Thread = struct {
                 is_waking = false;
 
                 const task: *Task = @fieldParentPtr("node", result.node);
-                (task.callback)(task);
+                if (on_before_run) |hook| hook(task);
+                // Sample after the hook. The callback word can be overwritten
+                // while the hook is looking up the schedule record.
+                const cb = task.callback;
+                const cb_bits = @intFromPtr(cb);
+                if (cb_bits == 0 or cb_bits == std.math.maxInt(usize)) {
+                    // Freed / poisoned Task — calling through it SEGV. Log once
+                    // via the hook and drop; product must fix the UAF schedule.
+                    if (on_before_run) |hook| hook(task);
+                    continue;
+                }
+                (cb)(task);
             }
         }
     }
