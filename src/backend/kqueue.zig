@@ -230,54 +230,33 @@ pub const Loop = struct {
             // submission queue and we're done.
             if (events_len == 0) break;
 
-            // Zero timeout so that kevent returns immediately.
-            var timeout = std.mem.zeroes(posix.timespec);
-            const completed = try kevent_syscall(
-                self.kqueue_fd,
-                events[0..events_len],
-                events[0..events.len],
-                &timeout,
-            );
+            // Receipts only. A full 256-slot event list made each later
+            // batch report every still-ready level-triggered filter again,
+            // so one completion was queued twice (#257). Ready events are
+            // reported once, by the wait in tick.
+            const receipts = try applyChanges(self.kqueue_fd, events[0..events_len]);
             events_len = 0;
 
-            // Go through the completed events and queue them.
-            // NOTE: we currently never process completions (we set
-            // event list to zero length) because it was leading to
-            // memory corruption we need to investigate.
-            for (events[0..completed]) |ev| {
+            for (receipts) |ev| {
                 // Zero udata values are internal events that we do nothing
                 // on such as the mach port wakeup.
                 if (ev.udata == 0) continue;
 
-                // We handle deletions separately.
+                // Deletions are already queued by the .deleting arm.
                 if (ev.flags & std.c.EV.DELETE != 0) continue;
 
+                // data 0: the filter registered. tick's wait reports it.
+                if (ev.data == 0) continue;
+
                 const c: *Completion = @ptrFromInt(@as(usize, @intCast(ev.udata)));
-
-                // Level-triggered filters report again every kevent until the
-                // callback drains them. Skip if already queued/dispatching —
-                // before perform() so a second read/accept cannot consume work
-                // then discard the result (farbenbuilds/libxev XEV-004/#169).
-                if (c.flags.state != .active or
-                    c.flags.threadpool or
-                    c.next != null or
-                    self.completions.tail == c) continue;
-
-                // If EV_ERROR is set, then submission failed for this
-                // completion. We get the syscall errorcode from data and
-                // store it.
-                if (ev.flags & std.c.EV.ERROR != 0) {
-                    c.result = c.syscall_result(-@as(i32, @intCast(ev.data)));
-                    // Filter never registered; balance active from start().
+                c.result = c.syscall_result(-@as(i32, @intCast(ev.data)));
+                // Filter never registered; balance active from start().
+                if (c.flags.state == .active) {
                     std.debug.assert(self.active > 0);
                     self.active -= 1;
                     c.flags.state = .dead;
-                } else {
-                    // No error, means that this completion is ready to work.
-                    c.result = c.perform(&ev);
                 }
-
-                assert(c.result != null);
+                c.next = null;
                 self.completions.push(c);
             }
         }
@@ -460,11 +439,7 @@ pub const Loop = struct {
                     // we do nothing because we were never part of the kqueue.
                     .disarm => {
                         if (disarm_ev) |ev| {
-                            events[changes] = ev;
-                            events[changes].flags = std.c.EV.DELETE;
-                            events[changes].udata = 0;
-                            changes += 1;
-                            assert(changes <= events.len);
+                            try queueDelete(self.kqueue_fd, &events, &changes, ev);
                         }
 
                         if (c_active) self.active -= 1;
@@ -486,8 +461,6 @@ pub const Loop = struct {
                     },
                 }
 
-                // If we filled the events slice, we break to avoid overflow.
-                if (changes == events.len) break;
             }
 
             // Determine our next timeout based on the timers
@@ -576,13 +549,10 @@ pub const Loop = struct {
                 const action = c.callback(c.userdata, self, c, result);
                 switch (action) {
                     .disarm => {
-                        // Mark this event for deletion, it'll happen
-                        // on the next tick.
-                        events[changes] = ev;
-                        events[changes].flags = std.c.EV.DELETE;
-                        events[changes].udata = 0;
-                        changes += 1;
-                        assert(changes <= events.len);
+                        // Mark this event for deletion. Flush first when the
+                        // change list is full so the write cannot pass the array
+                        // (ReleaseFast drops the assert; #257).
+                        try queueDelete(self.kqueue_fd, &events, &changes, ev);
 
                         self.active -= 1;
                     },
@@ -1559,6 +1529,14 @@ fn mapReadError(err: anyerror) ReadError {
     return switch (err) {
         error.AccessDenied, error.PermissionDenied => error.PermissionDenied,
         error.WouldBlock => error.MissingKevent,
+        error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+        error.ConnectionTimedOut => error.ConnectionTimedOut,
+        error.SocketNotConnected => error.SocketNotConnected,
+        error.InputOutput => error.InputOutput,
+        error.SystemResources => error.SystemResources,
+        error.NotOpenForReading => error.NotOpenForReading,
+        error.ProcessNotFound => error.ProcessNotFound,
+        error.IsDir => error.IsDir,
         else => error.Unexpected,
     };
 }
@@ -1566,6 +1544,12 @@ fn mapReadError(err: anyerror) ReadError {
 fn mapWriteError(err: anyerror) WriteError {
     return switch (err) {
         error.AccessDenied, error.PermissionDenied => error.PermissionDenied,
+        error.WouldBlock => error.WouldBlock,
+        error.BrokenPipe => error.BrokenPipe,
+        error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+        error.InputOutput => error.InputOutput,
+        error.SystemResources => error.SystemResources,
+        error.NotOpenForWriting => error.NotOpenForWriting,
         else => error.Unexpected,
     };
 }
@@ -1763,12 +1747,23 @@ pub const ReadError = KEventError || error{
     MissingKevent,
     PermissionDenied,
     Unexpected,
+    ConnectionResetByPeer,
+    ConnectionTimedOut,
+    SocketNotConnected,
+    InputOutput,
+    NotOpenForReading,
+    IsDir,
 };
 
 pub const WriteError = KEventError || error{
     Canceled,
     PermissionDenied,
     Unexpected,
+    WouldBlock,
+    BrokenPipe,
+    ConnectionResetByPeer,
+    InputOutput,
+    NotOpenForWriting,
 };
 
 pub const MachPortError = KEventError || error{
@@ -1899,6 +1894,30 @@ const Kevent = switch (builtin.os.tag) {
     .freebsd => std.c.Kevent,
     else => @compileError("kqueue not supported yet for target OS"),
 };
+
+/// Applies `changes` without taking any pending event. `EV_RECEIPT` makes
+/// the kernel return one event per change into this same buffer (`EV_ERROR`,
+/// data zero on success). An event list of that length leaves no room to
+/// scan for already-ready filters (#257).
+fn applyChanges(kq: i32, changes: []Kevent) KEventError![]Kevent {
+    for (changes) |*ev| ev.flags |= std.c.EV.RECEIPT;
+    var timeout = std.mem.zeroes(posix.timespec);
+    const n = try kevent_syscall(kq, changes, changes, &timeout);
+    return changes[0..n];
+}
+
+/// Queue one `EV_DELETE`. A full change list is flushed first so `events[256]`
+/// is never written.
+fn queueDelete(kq: i32, events: *[256]Kevent, changes: *usize, ev: Kevent) KEventError!void {
+    if (changes.* == events.len) {
+        _ = try applyChanges(kq, events[0..changes.*]);
+        changes.* = 0;
+    }
+    events[changes.*] = ev;
+    events[changes.*].flags = std.c.EV.DELETE;
+    events[changes.*].udata = 0;
+    changes.* += 1;
+}
 
 /// kevent calls either kevent or kevent64 depending on the
 /// target platform.
