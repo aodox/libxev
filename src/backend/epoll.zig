@@ -1000,6 +1000,11 @@ pub const Completion = struct {
         };
     }
 
+    /// XEV-006: deletion already queued. Public `state()` still reports `.active`.
+    pub fn deleting(self: Completion) bool {
+        return self.flags.state == .deleting;
+    }
+
     /// Perform the operation associated with this completion. This will
     /// perform the full blocking operation for the completion.
     fn perform(self: *Completion) Result {

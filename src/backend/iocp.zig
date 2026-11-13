@@ -1087,6 +1087,11 @@ pub const Completion = struct {
         };
     }
 
+    /// XEV-006: IOCP has no EV_DELETE queue; always false.
+    pub fn deleting(_: Completion) bool {
+        return false;
+    }
+
     /// Returns a handle for the current operation if it makes sense.
     fn handle(self: Completion) ?windows.HANDLE {
         return switch (self.op) {

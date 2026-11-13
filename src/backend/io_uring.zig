@@ -658,6 +658,11 @@ pub const Completion = struct {
         };
     }
 
+    /// XEV-006: no separate deleting state on io_uring; always false.
+    pub fn deleting(_: Completion) bool {
+        return false;
+    }
+
     /// Invokes the callback for this completion after properly constructing
     /// the Result based on the res code.
     fn invoke(self: *Completion, loop: *Loop, res: i32) CallbackAction {

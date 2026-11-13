@@ -1053,6 +1053,13 @@ pub const Completion = struct {
         };
     }
 
+    /// XEV-006: EV_DELETE is queued / in flight. Public `state()` still reports
+    /// `.active`, so product Abort-wait uses this to skip a second cancel
+    /// (would otherwise look like `*_cancel_skip`).
+    pub fn deleting(self: Completion) bool {
+        return self.flags.state == .deleting;
+    }
+
     /// Returns a kevent for this completion, if any. Note that the
     /// kevent isn't immediately useful for all event types. For example,
     /// "connect" requires you to initiate the connection first.

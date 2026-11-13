@@ -664,6 +664,11 @@ pub const Completion = struct {
         };
     }
 
+    /// XEV-006: deletion already queued. Public `state()` still reports `.active`.
+    pub fn deleting(self: Completion) bool {
+        return self.flags.state == .deleting;
+    }
+
     fn subscription(self: *Completion) wasi.subscription_t {
         return switch (self.op) {
             .read => |v| .{
